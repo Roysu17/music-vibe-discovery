@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import csv
@@ -32,9 +33,17 @@ import requests
 import tkinter as tk
 from tkinter import messagebox
 
+try:
+    from PIL import Image, ImageOps, ImageTk  # type: ignore[import-not-found]
+except ImportError:
+    Image = None
+    ImageOps = None
+    ImageTk = None
+
 
 DB_JSON = Path("song_database.json")
 DB_CSV = Path("song_database.csv")
+APP_CONFIG_JSON = Path.home() / ".music_vibe_discovery_config.json"
 
 
 SEARCH_TERMS = [
@@ -86,6 +95,7 @@ class SongRecord:
     combined_tags: List[str] = field(default_factory=list)
     youtube_url: str = ""
     source_url: str = ""
+    artwork_url: str = ""
     itunes_track_id: str = ""
     fetched_at_utc: str = ""
 
@@ -156,6 +166,25 @@ def save_database(records: List[SongRecord]) -> None:
             writer.writerow(row)
 
 
+def load_app_config(path: Path = APP_CONFIG_JSON) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    return {str(key): str(value) for key, value in raw.items() if isinstance(value, (str, int, float, bool))}
+
+
+def save_app_config(config: Dict[str, str], path: Path = APP_CONFIG_JSON) -> None:
+    path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def fetch_random_song() -> Optional[Dict[str, str]]:
     term = random.choice(SEARCH_TERMS)
     params = {
@@ -184,6 +213,10 @@ def fetch_random_song() -> Optional[Dict[str, str]]:
     length_seconds = int((pick.get("trackTimeMillis") or 0) / 1000)
 
     explicitness = str(pick.get("trackExplicitness", "")).lower()
+    artwork_url = str(pick.get("artworkUrl100", ""))
+    if artwork_url:
+        # iTunes supports larger variants by replacing NxN in the URL.
+        artwork_url = re.sub(r"/\d+x\d+bb\.jpg$", "/600x600bb.jpg", artwork_url)
 
     return {
         "title": str(pick.get("trackName", "")),
@@ -193,6 +226,7 @@ def fetch_random_song() -> Optional[Dict[str, str]]:
         "length_seconds": length_seconds,
         "genre": str(pick.get("primaryGenreName", "")),
         "source_url": str(pick.get("trackViewUrl", "")),
+        "artwork_url": artwork_url,
         "itunes_track_id": str(pick.get("trackId", "")),
         "album_date": year,
         "duration_seconds": length_seconds,
@@ -373,29 +407,45 @@ def fetch_lastfm_tags(artist: str, track: str, limit: int = 8) -> List[str]:
     if not api_key:
         return []
 
-    params = {
-        "method": "track.gettoptags",
-        "api_key": api_key,
-        "artist": artist,
-        "track": track,
-        "autocorrect": 1,
-        "format": "json",
-    }
+    def _request(method: str, **extra: Any) -> List[str]:
+        params = {
+            "method": method,
+            "api_key": api_key,
+            "autocorrect": 1,
+            "format": "json",
+            **extra,
+        }
 
-    try:
-        response = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException:
-        return []
+        try:
+            response = requests.get("https://ws.audioscrobbler.com/2.0/", params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException:
+            return []
 
-    tags = data.get("toptags", {}).get("tag", [])
-    out: List[str] = []
-    for item in tags[:limit]:
-        if isinstance(item, dict) and item.get("name"):
+        tags = data.get("toptags", {}).get("tag", [])
+        out: List[str] = []
+        for item in tags:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            # Prefer tags with some community weight when that metadata exists.
+            if "count" in item:
+                try:
+                    if int(item.get("count", 0)) <= 0:
+                        continue
+                except (TypeError, ValueError):
+                    pass
             out.append(str(item["name"]))
 
-    return unique_keep_order(out)
+        return unique_keep_order(out)[:limit]
+
+    # Try track tags first; many tracks do not have enough community tagging.
+    track_tags = _request("track.gettoptags", artist=artist, track=track)
+    if track_tags:
+        return track_tags
+
+    # Fallback to artist-level tags for broader coverage.
+    return _request("artist.gettoptags", artist=artist)
 
 
 def find_youtube_link(artist: str, track: str) -> str:
@@ -428,11 +478,16 @@ class SongTaggingApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Music Vibe Discovery - Song Tagging App")
-        self.root.geometry("940x700")
+        self.root.geometry("1480x1000")
 
         self.records = load_database(DB_JSON)
         self.current_song: Optional[Dict[str, str]] = None
         self.current_internet_tags: List[str] = []
+        self.album_art_photo: Optional[tk.PhotoImage] = None
+        self.app_config = load_app_config()
+        self.lastfm_api_key = os.getenv("LASTFM_API_KEY", "").strip() or self.app_config.get("lastfm_api_key", "").strip()
+        if self.lastfm_api_key:
+            os.environ["LASTFM_API_KEY"] = self.lastfm_api_key
 
         self._build_ui()
 
@@ -451,6 +506,36 @@ class SongTaggingApp:
         self.status_var = tk.StringVar(value=f"Loaded {len(self.records)} saved songs.")
         status_label = tk.Label(frame, textvariable=self.status_var, fg="#444")
         status_label.pack(fill="x", pady=(0, 10))
+
+        lastfm_frame = tk.LabelFrame(frame, text="Last.fm", padx=10, pady=8)
+        lastfm_frame.pack(fill="x", pady=(0, 12))
+
+        self.lastfm_key_var = tk.StringVar(value=self.lastfm_api_key)
+        self.lastfm_key_visible = False
+        tk.Label(lastfm_frame, text="API Key:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.lastfm_key_entry = tk.Entry(lastfm_frame, textvariable=self.lastfm_key_var, width=48, show="*")
+        self.lastfm_key_entry.pack(side="left", padx=(8, 8))
+        self.lastfm_toggle_button = tk.Button(
+            lastfm_frame,
+            text="Show",
+            command=self.toggle_lastfm_key_visibility,
+            padx=8,
+            pady=3,
+        )
+        self.lastfm_toggle_button.pack(side="left", padx=(0, 8))
+        tk.Button(
+            lastfm_frame,
+            text="Save Key",
+            command=self.save_lastfm_key,
+            bg="#6f42c1",
+            fg="white",
+            padx=10,
+            pady=3,
+        ).pack(side="left")
+
+        self.lastfm_status_var = tk.StringVar(value="")
+        tk.Label(lastfm_frame, textvariable=self.lastfm_status_var, fg="#444").pack(side="left", padx=(12, 0))
+        self._refresh_lastfm_status()
 
         button_row = tk.Frame(frame)
         button_row.pack(fill="x", pady=(0, 12))
@@ -481,8 +566,30 @@ class SongTaggingApp:
 
         details_frame = tk.LabelFrame(frame, text="Song Details", padx=8, pady=8)
         details_frame.pack(fill="both", pady=(0, 10))
-        details_frame.configure(height=360)
+        details_frame.configure(height=480)
         details_frame.pack_propagate(False)
+
+        art_frame = tk.Frame(details_frame, padx=8, pady=8)
+        art_frame.pack(side="left", fill="y")
+
+        self.album_art_label = tk.Label(
+            art_frame,
+            text="No album art",
+            width=42,
+            height=22,
+            bg="#f3f3f3",
+            fg="#666",
+            relief="solid",
+            bd=1,
+            wraplength=320,
+            justify="center",
+        )
+        self.album_art_label.pack()
+
+        self.album_art_caption_var = tk.StringVar(value="")
+        tk.Label(art_frame, textvariable=self.album_art_caption_var, fg="#555", wraplength=320, justify="center").pack(
+            pady=(8, 0)
+        )
 
         self.details_canvas = tk.Canvas(details_frame, highlightthickness=0)
         details_scroll = tk.Scrollbar(details_frame, orient="vertical", command=self.details_canvas.yview)
@@ -612,6 +719,78 @@ class SongTaggingApp:
         if url.startswith("http://") or url.startswith("https://"):
             webbrowser.open(url)
 
+    def _refresh_lastfm_status(self) -> None:
+        key = self.lastfm_key_var.get().strip() if hasattr(self, "lastfm_key_var") else ""
+        if key:
+            self.lastfm_status_var.set(f"Loaded ({len(key)} chars)")
+        else:
+            self.lastfm_status_var.set("No key saved")
+
+    def toggle_lastfm_key_visibility(self) -> None:
+        self.lastfm_key_visible = not self.lastfm_key_visible
+        self.lastfm_key_entry.configure(show="" if self.lastfm_key_visible else "*")
+        self.lastfm_toggle_button.configure(text="Hide" if self.lastfm_key_visible else "Show")
+
+    def save_lastfm_key(self) -> None:
+        key = self.lastfm_key_var.get().strip()
+
+        if key:
+            self.app_config["lastfm_api_key"] = key
+            os.environ["LASTFM_API_KEY"] = key
+        else:
+            self.app_config.pop("lastfm_api_key", None)
+            os.environ.pop("LASTFM_API_KEY", None)
+
+        try:
+            save_app_config(self.app_config)
+        except OSError as exc:
+            messagebox.showerror("Save failed", f"Could not save settings: {exc}")
+            return
+
+        self._refresh_lastfm_status()
+        if key:
+            self.status_var.set("Last.fm API key saved on this device.")
+            messagebox.showinfo("Saved", f"Last.fm API key saved to {APP_CONFIG_JSON}")
+        else:
+            self.status_var.set("Last.fm API key cleared from this device.")
+            messagebox.showinfo("Saved", f"Last.fm API key removed from {APP_CONFIG_JSON}")
+
+    def _render_album_art(self, artwork_url: str) -> None:
+        self.album_art_photo = None
+        self.album_art_caption_var.set("")
+        self.album_art_label.configure(image="", text="No album art", bg="#f3f3f3", fg="#666")
+
+        if not artwork_url:
+            self.album_art_caption_var.set("No artwork URL found")
+            return
+
+        if Image is None or ImageTk is None or ImageOps is None:
+            self.album_art_caption_var.set("Install Pillow to display album art: pip install pillow")
+            return
+
+        try:
+            response = requests.get(artwork_url, timeout=15)
+            response.raise_for_status()
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+
+            # Always present a large, consistent cover size.
+            # contain() will upscale tiny images and downscale huge ones while
+            # preserving aspect ratio, then we center on a square canvas.
+            target_size = 380
+            fitted = ImageOps.contain(image, (target_size, target_size), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (target_size, target_size), "white")
+            x = (target_size - fitted.width) // 2
+            y = (target_size - fitted.height) // 2
+            canvas.paste(fitted, (x, y))
+            photo = ImageTk.PhotoImage(canvas)
+        except (requests.RequestException, OSError, ValueError):
+            self.album_art_caption_var.set("Failed to load album art")
+            return
+
+        self.album_art_photo = photo
+        self.album_art_label.configure(image=self.album_art_photo, text="", bg="#ffffff")
+        self.album_art_caption_var.set("Album art")
+
     def pop_new_song(self) -> None:
         self.status_var.set("Fetching song from internet...")
         self.root.update_idletasks()
@@ -641,6 +820,7 @@ class SongTaggingApp:
 
         self.current_song = song
         self.current_internet_tags = internet_tags
+        self._render_album_art(str(song.get("artwork_url", "")))
 
         self.detail_vars["title"].set(song["title"])
         self.detail_vars["artist"].set(song["artist"])
@@ -674,7 +854,10 @@ class SongTaggingApp:
         if internet_tags:
             self.internet_tags_var.set(", ".join(internet_tags))
         else:
-            self.internet_tags_var.set("No internet tags found (set LASTFM_API_KEY for richer tags).")
+            if os.getenv("LASTFM_API_KEY", "").strip():
+                self.internet_tags_var.set("No internet tags found for this song/artist on Last.fm.")
+            else:
+                self.internet_tags_var.set("No internet tags found (set LASTFM_API_KEY for richer tags).")
 
         self.user_tags_text.delete("1.0", "end")
         self.notes_text.delete("1.0", "end")
@@ -752,6 +935,7 @@ class SongTaggingApp:
             combined_tags=combined_tags,
             youtube_url=song.get("youtube_url", ""),
             source_url=song.get("source_url", ""),
+            artwork_url=song.get("artwork_url", ""),
             itunes_track_id=song.get("itunes_track_id", ""),
             fetched_at_utc=datetime.now(timezone.utc).isoformat(),
         )
