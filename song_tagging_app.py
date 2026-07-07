@@ -63,6 +63,25 @@ SEARCH_TERMS = [
 ]
 
 
+MOOD_OPTIONS = [
+    "",
+    "dreamy",
+    "melancholy",
+    "soft",
+    "warm",
+    "bright",
+    "upbeat",
+    "loud",
+    "chaotic",
+    "romantic",
+    "angry",
+    "nostalgic",
+    "quiet",
+    "intimate",
+    "gritty",
+]
+
+
 @dataclass
 class SongRecord:
     title: str
@@ -90,12 +109,14 @@ class SongRecord:
     isrc: str = ""
     explicit: bool = False
     genre: str = ""
+    mood: str = ""
     internet_tags: List[str] = field(default_factory=list)
     user_tags: List[str] = field(default_factory=list)
     combined_tags: List[str] = field(default_factory=list)
     youtube_url: str = ""
     source_url: str = ""
     artwork_url: str = ""
+    is_favorite: bool = False
     itunes_track_id: str = ""
     fetched_at_utc: str = ""
 
@@ -564,6 +585,29 @@ class SongTaggingApp:
         )
         self.save_button.pack(side="left", padx=(10, 0))
 
+        self.favorite_var = tk.BooleanVar(value=False)
+        self.favorite_check = tk.Checkbutton(
+            button_row,
+            text="Star this song",
+            variable=self.favorite_var,
+            onvalue=True,
+            offvalue=False,
+            font=("Segoe UI", 10, "bold"),
+            padx=8,
+            pady=6,
+        )
+        self.favorite_check.pack(side="left", padx=(12, 0))
+
+        mood_row = tk.Frame(frame)
+        mood_row.pack(fill="x", pady=(0, 8))
+
+        tk.Label(mood_row, text="Mood:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.mood_var = tk.StringVar(value="")
+        self.mood_menu = tk.OptionMenu(mood_row, self.mood_var, *MOOD_OPTIONS)
+        self.mood_menu.config(width=16)
+        self.mood_menu.pack(side="left", padx=(8, 0))
+        tk.Label(mood_row, text="Pick the best fit before saving.", fg="#555").pack(side="left", padx=(10, 0))
+
         details_frame = tk.LabelFrame(frame, text="Song Details", padx=8, pady=8)
         details_frame.pack(fill="both", pady=(0, 10))
         details_frame.configure(height=480)
@@ -631,6 +675,7 @@ class SongTaggingApp:
             "time_signature": tk.StringVar(value=""),
             "isrc": tk.StringVar(value=""),
             "explicit": tk.StringVar(value=""),
+            "mood": tk.StringVar(value=""),
             "youtube": tk.StringVar(value=""),
             "source": tk.StringVar(value=""),
         }
@@ -670,6 +715,7 @@ class SongTaggingApp:
         self._detail_row(details_inner, "Time Signature", self.detail_vars["time_signature"])
         self._detail_row(details_inner, "ISRC", self.detail_vars["isrc"])
         self._detail_row(details_inner, "Explicit", self.detail_vars["explicit"])
+        self._detail_row(details_inner, "Mood", self.detail_vars["mood"])
 
         tags_frame = tk.LabelFrame(frame, text="Tags", padx=12, pady=10)
         tags_frame.pack(fill="both", expand=True)
@@ -847,6 +893,7 @@ class SongTaggingApp:
         self.detail_vars["time_signature"].set(str(song.get("time_signature", "")) or "n/a")
         self.detail_vars["isrc"].set(str(song.get("isrc", "")) or "n/a")
         self.detail_vars["explicit"].set("yes" if bool(song.get("explicit", False)) else "no")
+        self.detail_vars["mood"].set(self.mood_var.get().strip() or "n/a")
         self.detail_vars["youtube"].set(song.get("youtube_url", ""))
         self.detail_vars["source"].set(song.get("source_url", ""))
         self._refresh_link_styles()
@@ -861,9 +908,13 @@ class SongTaggingApp:
 
         self.user_tags_text.delete("1.0", "end")
         self.notes_text.delete("1.0", "end")
+        self.favorite_var.set(False)
+        self.mood_var.set("")
 
         existing = self._find_existing_record(song["itunes_track_id"], song["title"], song["artist"])
         if existing:
+            self.favorite_var.set(bool(existing.is_favorite))
+            self.mood_var.set(existing.mood or "")
             if existing.user_tags:
                 self.user_tags_text.insert("1.0", ", ".join(existing.user_tags))
             if existing.combined_tags and not existing.user_tags:
@@ -930,12 +981,14 @@ class SongTaggingApp:
             isrc=str(song.get("isrc", "")),
             explicit=bool(song.get("explicit", False)),
             genre=song.get("genre", ""),
+            mood=self.mood_var.get().strip(),
             internet_tags=self.current_internet_tags,
             user_tags=user_tags,
             combined_tags=combined_tags,
             youtube_url=song.get("youtube_url", ""),
             source_url=song.get("source_url", ""),
             artwork_url=song.get("artwork_url", ""),
+            is_favorite=bool(self.favorite_var.get()),
             itunes_track_id=song.get("itunes_track_id", ""),
             fetched_at_utc=datetime.now(timezone.utc).isoformat(),
         )
